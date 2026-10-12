@@ -1,0 +1,170 @@
+"""
+アクティブウィンドウのスクリーンショットを Excel に貼り付けるツール (Windows 用)
+
+使い方:
+    pip install keyboard pillow openpyxl
+    python window_capture_to_excel.py
+
+    - HOTKEY (初期値: F9) を押すと、その時点で最前面のウィンドウを撮影して
+      EXCEL_PATH のファイルに貼り付けます。
+    - 写真の下のセル(A列)に撮影時刻を書き込みます。
+    - A列に値が入っている最後の行を探し、その下に続けて貼るので重なりません。
+    - ESC キーで終了します。
+
+注意:
+    - 貼り付け先の Excel ファイルは閉じておいてください (開いていると保存に失敗します)。
+    - 行の高さは標準(15pt = 20px)を前提に、写真が占める行数を計算しています。
+"""
+
+import ctypes
+import datetime
+import io
+import math
+import os
+import sys
+import threading
+from ctypes import wintypes
+
+import keyboard
+from openpyxl import Workbook, load_workbook
+from openpyxl.drawing.image import Image as XLImage
+from PIL import ImageGrab
+
+# ===================== 設定 =====================
+HOTKEY = "f9"                       # 撮影して貼り付けるキー
+EXIT_KEY = "esc"                    # 終了キー
+EXCEL_PATH = r"C:\temp\screenshots.xlsx"   # 貼り付け先 Excel ファイル
+SHEET_NAME = None                   # None なら先頭シート
+MAX_WIDTH_PX = 800                  # 貼り付ける写真の最大幅(px)
+ROW_HEIGHT_PX = 20                  # 1行の高さ(標準 15pt = 20px)
+GAP_ROWS = 1                        # 写真ブロック同士の間に空ける行数
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"   # 時刻の書式
+# ================================================
+
+# 高DPI環境で座標がずれないようにする
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+_lock = threading.Lock()
+
+
+def get_active_window_rect():
+    """最前面ウィンドウの (left, top, right, bottom) を返す。取得できなければ None。"""
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd or user32.IsIconic(hwnd):
+        return None
+
+    rect = wintypes.RECT()
+    DWMWA_EXTENDED_FRAME_BOUNDS = 9
+    # 影などを除いた見た目どおりの範囲を取得
+    res = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+        wintypes.HWND(hwnd),
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        ctypes.byref(rect),
+        ctypes.sizeof(rect),
+    )
+    if res != 0:
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+
+    if rect.right <= rect.left or rect.bottom <= rect.top:
+        return None
+    return rect.left, rect.top, rect.right, rect.bottom
+
+
+def capture_active_window():
+    rect = get_active_window_rect()
+    if rect is None:
+        return None
+    return ImageGrab.grab(bbox=rect, all_screens=True)
+
+
+def open_workbook():
+    if os.path.exists(EXCEL_PATH):
+        wb = load_workbook(EXCEL_PATH)
+    else:
+        folder = os.path.dirname(EXCEL_PATH)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        wb = Workbook()
+    ws = wb[SHEET_NAME] if SHEET_NAME else wb.worksheets[0]
+    return wb, ws
+
+
+def last_used_row_in_column_a(ws):
+    """A列で値が入っている最後の行番号。何もなければ 0。"""
+    for row in range(ws.max_row, 0, -1):
+        value = ws.cell(row=row, column=1).value
+        if value not in (None, ""):
+            return row
+    return 0
+
+
+def paste_to_excel(image):
+    # 幅が大きすぎる場合は縮小
+    w, h = image.size
+    if w > MAX_WIDTH_PX:
+        scale = MAX_WIDTH_PX / w
+        w, h = int(w * scale), int(h * scale)
+        image = image.resize((w, h))
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    buf.seek(0)
+
+    wb, ws = open_workbook()
+
+    last = last_used_row_in_column_a(ws)
+    start_row = 1 if last == 0 else last + 1 + GAP_ROWS
+
+    xl_img = XLImage(buf)
+    xl_img.width, xl_img.height = w, h
+    xl_img.anchor = f"A{start_row}"
+    ws.add_image(xl_img)
+
+    rows_used = math.ceil(h / ROW_HEIGHT_PX)
+    time_row = start_row + rows_used          # 写真の真下のセル
+    now = datetime.datetime.now().strftime(TIME_FORMAT)
+    ws.cell(row=time_row, column=1, value=now)
+
+    wb.save(EXCEL_PATH)
+    return start_row, time_row, now
+
+
+def on_hotkey():
+    # 連打で二重実行されないようにする
+    if not _lock.acquire(blocking=False):
+        return
+    try:
+        img = capture_active_window()
+        if img is None:
+            print("[!] アクティブウィンドウを取得できませんでした (最小化中など)")
+            return
+        start_row, time_row, now = paste_to_excel(img)
+        print(f"[OK] {now}  写真: A{start_row}〜  時刻: A{time_row}")
+    except PermissionError:
+        print("[!] Excel ファイルが開かれているため保存できません。閉じてからもう一度押してください。")
+    except Exception as e:
+        print(f"[!] エラー: {e}")
+    finally:
+        _lock.release()
+
+
+def main():
+    if sys.platform != "win32":
+        print("このスクリプトは Windows 専用です。")
+        return
+    print(f"{HOTKEY.upper()} キーで撮影 → {EXCEL_PATH} に貼り付けます。{EXIT_KEY.upper()} キーで終了。")
+    # キー入力のスレッドで重い処理をしないよう別スレッドで実行
+    keyboard.add_hotkey(HOTKEY, lambda: threading.Thread(target=on_hotkey, daemon=True).start())
+    keyboard.wait(EXIT_KEY)
+    print("終了しました。")
+
+
+if __name__ == "__main__":
+    main()
